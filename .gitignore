@@ -87,3 +87,29 @@ coverage*.info
 appsettings-schema.json
 appsettings-schema.*.json
 umbraco-package-schema.json
+
+# Umbraco standard .gitignore
+*.user
+*.suo
+*.vspx
+*.pdb
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/App_Data/Logs/
+/App_Data/NuCache/
+/App_Data/TEMP/
+*.log
+
+# VS/Build
+bin/
+obj/
+.vscode/
+.vs/
+.idea/
+
+# Publish
+publish/
+
