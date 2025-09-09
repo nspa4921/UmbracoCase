@@ -1,120 +1,120 @@
-// NC_SelfRegService.cls
-public with sharing class NC_SelfRegService {
-    public class RegRequest {
-        @AuraEnabled public String firstName;
-        @AuraEnabled public String lastName;
-        @AuraEnabled public String email;
-        @AuraEnabled public String password;
-        @AuraEnabled public String locale;      // npr. 'en_US' / 'ja_JP'
-        @AuraEnabled public String timeZone;    // npr. 'GMT'
-        @AuraEnabled public String language;    // npr. 'en'
-        @AuraEnabled public String browserId;   // za kasnije merge assessment-a (opciono)
-        @AuraEnabled public Boolean newsletterOptIn;
+public without sharing class NCSelfRegService {
+    // Helper to build a new User record for registration
+    private static User getPopulatedNewUserRecord(String firstName, String lastName, String email, Id contactId, Id profileId, Id roleId) {
+        return new User(
+            FirstName = firstName,
+            LastName = lastName,
+            Email = email,
+            UserName = email + '.NovoCare',
+            Alias = email.left(8),
+            ContactId = contactId,
+            CommunityNickname = lastName.left(8) + firstName.left(8) + String.valueOf(System.now().getTime()),
+            ProfileId = profileId,
+            UserRoleId = roleId,
+            TimeZoneSidKey = 'GMT',
+            LocaleSidKey = 'en_US',
+            LanguageLocaleKey = 'en_US',
+            EmailEncodingKey = 'UTF-8'
+        );
     }
+    @future
+    private static void createExperienceCloudUser(String firstName, String lastName, String email, String password, Id contactId) {
+        try {
+            Id profileId = [SELECT Id FROM Profile WHERE Name = 'NovoCare Community Plus Login User' LIMIT 1].Id;
+            Id roleId = [SELECT Id FROM UserRole WHERE Name = 'Community Account Owner' LIMIT 1].Id;
+            User u = new User();
+            u.Username = email + '.' + System.currentTimeMillis() + '@example.com';
+            u.Alias = (firstName.substring(0,1) + lastName.substring(0,1)).toLowerCase();
+            u.LastName = lastName != null ? lastName.trim() : '';
+            u.Email = email;
+            u.EmailEncodingKey = 'UTF-8';
+            u.TimeZoneSidKey = 'GMT';
+            u.LocaleSidKey = 'en_US';
+            u.LanguageLocaleKey = 'en_US';
+            u.ProfileId = profileId;
+            u.ContactId = contactId;
+            u.UserRoleId = roleId;
+            insert u;
+            System.setPassword(u.Id, password);
+        } catch (Exception e) {
+            System.debug('Error creating Experience Cloud User: ' + e.getMessage());
+        }
+    }
+    // Returns the Id of a user with a role, found by email. Throws if not found.
+    private static Id getPaOwnerId() {
+        String ownerEmail = 'qenp+ncjpdev1@novonordisk.com';
+        List<User> usersWithRole = [
+            SELECT Id FROM User WHERE Email = :ownerEmail AND UserRoleId != null LIMIT 1
+        ];
+        if (usersWithRole.isEmpty()) {
+            throw new AuraHandledException('No user with role found for email: ' + ownerEmail);
+        }
+        return usersWithRole[0].Id;
+    }
+    // RegRequest class no longer needed for LWC compatibility
     public class RegResponse {
         @AuraEnabled public Boolean success;
         @AuraEnabled public String message;
+        @AuraEnabled public String accountId;
+        @AuraEnabled public String userId;
     }
 
     @AuraEnabled(cacheable=false)
-    public static RegResponse register(RegRequest req) {
+    public static RegResponse register(String firstName, String lastName, String email, String password) {
         RegResponse res = new RegResponse();
-        if (String.isBlank(req.email) || String.isBlank(req.password) || String.isBlank(req.firstName) || String.isBlank(req.lastName)) {
-            res.success = false; res.message = 'Missing required fields.'; return res;
+        System.debug('NCSelfRegService.register received: ' + firstName + ', ' + lastName + ', ' + email + ', ' + password);
+        if (String.isBlank(email) || String.isBlank(password) || String.isBlank(firstName) || String.isBlank(lastName)) {
+            res.success = false;
+            res.message = 'Missing required fields.';
+            return res;
         }
+        try {
+            // Create Person Account
+            Account pa = new Account();
+            pa.RecordTypeId = getPersonAccountRecordTypeId();
+            pa.FirstName = firstName;
+            pa.LastName = lastName;
+            pa.PersonEmail = email;
+            pa.OwnerId = getPaOwnerId();
+            insert pa;
+            res.accountId = pa.Id;
 
-        // 1) Ako već postoji Contact/PA za taj email:
-        Contact existingC = [SELECT Id, AccountId,
-                                    Account.PersonEmail,
-                                    (SELECT Id, IsActive FROM Users WHERE IsActive = true LIMIT 1)
-                               FROM Contact
-                               WHERE Email = :req.email
-                               LIMIT 1];
-        if (existingC != null) {
-            if (!existingC.Users.isEmpty()) {
-                res.success = false; res.message = 'An account already exists. Please log in or reset your password.'; return res;
-            }
-            // Kreiraj community user nad postojećim kontaktom
-            createCommunityUser(existingC, req);
-            // (opciono) Newsletter/consent/assessment merge
-            res.success = true; res.message = 'User created for existing contact.'; return res;
+            // Get Contact (created by Person Account insert)
+            Contact c = [SELECT Id FROM Contact WHERE AccountId = :pa.Id LIMIT 1];
+
+            // Get Profile and Role
+            Id profileId = [SELECT Id FROM Profile WHERE Name = 'NovoCare Community Plus Login User' LIMIT 1].Id;
+            Id roleId = [SELECT Id FROM UserRole WHERE Name = 'Community Account Owner' LIMIT 1].Id;
+
+            // Build User record
+            User newUser = getPopulatedNewUserRecord(firstName, lastName, email, c.Id, profileId, roleId);
+
+            // Use Salesforce API for self-registration
+            String regId = System.UserManagement.initSelfRegistration(
+                Auth.VerificationMethod.EMAIL, 
+                newUser
+            );
+
+            res.userId = regId;
+            res.success = true;
+            res.message = 'Registration successful.';
+        } catch (Exception e) {
+            res.success = false;
+            res.message = 'Error: ' + e.getMessage();
         }
-
-        // 2) Kreiraj Person Account (FORCIRANO)
-        Id personRtId = getPersonAccountRecordTypeId();
-        if (personRtId == null) {
-            res.success = false; res.message = 'Person Account record type not found.'; return res;
-        }
-
-        Account pa = new Account();
-        pa.RecordTypeId = personRtId;
-        pa.FirstName     = req.firstName;
-        pa.LastName      = req.lastName;
-        pa.PersonEmail   = req.email;
-        insert pa;
-
-        // Dohvati automatski kreirani Contact
-        Contact c = [SELECT Id, AccountId FROM Contact WHERE AccountId = :pa.Id LIMIT 1];
-
-        // 3) Kreiraj Experience Cloud User (portal user) i setuj lozinku
-        createCommunityUser(c, req);
-
-        // (opciono) ovde pozovi AssessmentMergeService.merge(req.browserId, c.Id);
-        // (opciono) Newsletter/Consent upis
-
-        res.success = true;
-        res.message = 'Registration successful.';
         return res;
-    }
-
-    private static void createCommunityUser(Contact c, RegRequest req) {
-        // PROFIL za community korisnike — prilagodi svojoj org konfiguraciji!
-        // (npr. 'Customer Community Plus User' ili custom community profil)
-        Id portalProfileId = [SELECT Id FROM Profile WHERE Name = 'Customer Community Plus User' LIMIT 1].Id;
-
-        User u = new User();
-        u.Username            = uniqueUsername(req.email);
-        u.Alias               = (req.firstName.substring(0,1) + req.lastName.substring(0,1)).toLowerCase();
-        u.Email               = req.email;
-        u.EmailEncodingKey    = 'UTF-8';
-        u.TimeZoneSidKey      = String.isBlank(req.timeZone) ? 'GMT' : req.timeZone;
-        u.LocaleSidKey        = String.isBlank(req.locale) ? 'en_US' : req.locale;
-        u.LanguageLocaleKey   = String.isBlank(req.language) ? 'en' : req.language;
-        u.ProfileId           = portalProfileId;
-        u.ContactId           = c.Id;
-
-        // Važno: za Experience Cloud koristimo Site.createExternalUser
-        // Ovo mora da se izvršava iz konteksta guest sajta/portala
-        System.runAs(new User(Id=UserInfo.getUserId())) {
-            Site.createExternalUser(u, c.Account, req.password);
-        }
-    }
-
-    private static String uniqueUsername(String base) {
-        // U sandboxovima Username mora biti jedinstven org-wide; dodaj sufiks ako postoji
-        Integer tries = 0;
-        String candidate = base;
-        while (true) {
-            List<User> u = [SELECT Id FROM User WHERE Username = :candidate LIMIT 1];
-            if (u.isEmpty()) return candidate;
-            tries++;
-            candidate = base.replace('@','+'+tries+'@');
-        }
     }
 
     private static Id getPersonAccountRecordTypeId() {
         Map<String, Schema.RecordTypeInfo> byDevName =
             Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName();
         if (byDevName.containsKey('PersonAccount')) return byDevName.get('PersonAccount').getRecordTypeId();
-
-        // Fallback: traži po labeli
         for (Schema.RecordTypeInfo rti : Schema.SObjectType.Account.getRecordTypeInfos()) {
             if (rti.isAvailable() && rti.getName() == 'Person Account') return rti.getRecordTypeId();
         }
         return null;
     }
 }
-
 ---
 
 ### 1. Umbraco Setup
