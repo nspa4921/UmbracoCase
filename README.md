@@ -1,101 +1,96 @@
 public without sharing class NCSelfRegService {
+
+    // ---- helper: safe nick (<=40) ----
+    private static String nick(String firstName, String lastName) {
+        String n = (lastName != null ? lastName.left(20) : '') +
+                   (firstName != null ? firstName.left(20) : '');
+        if (String.isBlank(n)) n = 'user' + String.valueOf(System.now().getTime());
+        return n.left(40);
+    }
+
     // Helper to build a new User record for registration
-    private static User getPopulatedNewUserRecord(String firstName, String lastName, String email, Id contactId, Id profileId, Id roleId) {
+    private static User getPopulatedNewUserRecord(
+        String firstName, String lastName, String email, Id contactId, Id profileId
+    ) {
         return new User(
-            FirstName = firstName,
-            LastName = lastName,
-            Email = email,
-            UserName = email + '.NovoCare',
-            Alias = email.left(8),
-            ContactId = contactId,
-            CommunityNickname = lastName.left(8) + firstName.left(8) + String.valueOf(System.now().getTime()),
-            ProfileId = profileId,
-            UserRoleId = roleId,
-            TimeZoneSidKey = 'GMT',
-            LocaleSidKey = 'en_US',
-            LanguageLocaleKey = 'en_US',
-            EmailEncodingKey = 'UTF-8'
+            FirstName          = firstName,
+            LastName           = String.isBlank(lastName) ? 'User' : lastName.trim(),
+            Email              = email,
+            Username           = String.valueOf(System.currentTimeMillis()) + '.' + email, // globalno unikatno
+            Alias              = (String.isBlank(email) ? 'user' : email.replace('@','_')).left(8),
+            ContactId          = contactId,
+            CommunityNickname  = nick(firstName, lastName),
+            ProfileId          = profileId,
+            // NEMA UserRoleId za customer community user-a
+            TimeZoneSidKey     = 'GMT',
+            LocaleSidKey       = 'en_US',
+            LanguageLocaleKey  = 'en_US',
+            EmailEncodingKey   = 'UTF-8'
         );
     }
-    @future
-    private static void createExperienceCloudUser(String firstName, String lastName, String email, String password, Id contactId) {
-        try {
-            Id profileId = [SELECT Id FROM Profile WHERE Name = 'NovoCare Community Plus Login User' LIMIT 1].Id;
-            Id roleId = [SELECT Id FROM UserRole WHERE Name = 'Community Account Owner' LIMIT 1].Id;
-            User u = new User();
-            u.Username = email + '.' + System.currentTimeMillis() + '@example.com';
-            u.Alias = (firstName.substring(0,1) + lastName.substring(0,1)).toLowerCase();
-            u.LastName = lastName != null ? lastName.trim() : '';
-            u.Email = email;
-            u.EmailEncodingKey = 'UTF-8';
-            u.TimeZoneSidKey = 'GMT';
-            u.LocaleSidKey = 'en_US';
-            u.LanguageLocaleKey = 'en_US';
-            u.ProfileId = profileId;
-            u.ContactId = contactId;
-            u.UserRoleId = roleId;
-            insert u;
-            System.setPassword(u.Id, password);
-        } catch (Exception e) {
-            System.debug('Error creating Experience Cloud User: ' + e.getMessage());
-        }
-    }
-    // Returns the Id of a user with a role, found by email. Throws if not found.
+
+    // User koji će biti owner PA (mora imati Role)
     private static Id getPaOwnerId() {
         String ownerEmail = 'qenp+ncjpdev1@novonordisk.com';
         List<User> usersWithRole = [
-            SELECT Id FROM User WHERE Email = :ownerEmail AND UserRoleId != null LIMIT 1
+            SELECT Id
+            FROM User
+            WHERE Email = :ownerEmail AND IsActive = true AND UserRoleId != null
+            LIMIT 1
         ];
         if (usersWithRole.isEmpty()) {
-            throw new AuraHandledException('No user with role found for email: ' + ownerEmail);
+            throw new AuraHandledException('No user with a Role found for email: ' + ownerEmail);
         }
         return usersWithRole[0].Id;
     }
-    // RegRequest class no longer needed for LWC compatibility
+
+    // RecordType za Person Account
+    private static Id getPersonAccountRecordTypeId() {
+        for (Schema.RecordTypeInfo rti : Schema.SObjectType.Account.getDescribe().getRecordTypeInfos()) {
+            if (rti.isPersonType()) return rti.getRecordTypeId();
+        }
+        throw new AuraHandledException('Person Account RecordType not found / PA not enabled.');
+    }
+
     public class RegResponse {
         @AuraEnabled public Boolean success;
-        @AuraEnabled public String message;
-        @AuraEnabled public String accountId;
-        @AuraEnabled public String userId;
+        @AuraEnabled public String  message;
+        @AuraEnabled public String  accountId;
+        @AuraEnabled public String  userId;
     }
 
     @AuraEnabled(cacheable=false)
     public static RegResponse register(String firstName, String lastName, String email, String password) {
         RegResponse res = new RegResponse();
-        System.debug('NCSelfRegService.register received: ' + firstName + ', ' + lastName + ', ' + email + ', ' + password);
         if (String.isBlank(email) || String.isBlank(password) || String.isBlank(firstName) || String.isBlank(lastName)) {
-            res.success = false;
-            res.message = 'Missing required fields.';
-            return res;
+            res.success = false; res.message = 'Missing required fields.'; return res;
         }
+
         try {
-            // Create Person Account
+            // 1) Person Account (owner mora imati Role)
             Account pa = new Account();
             pa.RecordTypeId = getPersonAccountRecordTypeId();
-            pa.FirstName = firstName;
-            pa.LastName = lastName;
-            pa.PersonEmail = email;
-            pa.OwnerId = getPaOwnerId();
+            pa.FirstName    = firstName;
+            pa.LastName     = lastName;
+            pa.PersonEmail  = email;
+            pa.OwnerId      = getPaOwnerId();   // KLJUČNO
             insert pa;
             res.accountId = pa.Id;
 
-            // Get Contact (created by Person Account insert)
+            // 2) Contact automatski kreiran za PA
             Contact c = [SELECT Id FROM Contact WHERE AccountId = :pa.Id LIMIT 1];
 
-            // Get Profile and Role
+            // 3) Profil za external user-a
             Id profileId = [SELECT Id FROM Profile WHERE Name = 'NovoCare Community Plus Login User' LIMIT 1].Id;
-            Id roleId = [SELECT Id FROM UserRole WHERE Name = 'Community Account Owner' LIMIT 1].Id;
 
-            // Build User record
-            User newUser = getPopulatedNewUserRecord(firstName, lastName, email, c.Id, profileId, roleId);
+            // 4) Pripremi User
+            User newUser = getPopulatedNewUserRecord(firstName, lastName, email, c.Id, profileId);
 
-            // Use Salesforce API for self-registration
-            String regId = System.UserManagement.initSelfRegistration(
-                Auth.VerificationMethod.EMAIL, 
-                newUser
-            );
+            // 5) Kreiraj external user-a (self-registration, radi iz guest konteksta)
+            //    Ako si u internom kontekstu, možeš umesto ovoga: insert newUser; System.setPassword(newUser.Id, password);
+            Id createdUserId = Site.createExternalUser(newUser, c.Id, password);
+            res.userId = createdUserId;
 
-            res.userId = regId;
             res.success = true;
             res.message = 'Registration successful.';
         } catch (Exception e) {
@@ -104,17 +99,10 @@ public without sharing class NCSelfRegService {
         }
         return res;
     }
-
-    private static Id getPersonAccountRecordTypeId() {
-        Map<String, Schema.RecordTypeInfo> byDevName =
-            Schema.SObjectType.Account.getRecordTypeInfosByDeveloperName();
-        if (byDevName.containsKey('PersonAccount')) return byDevName.get('PersonAccount').getRecordTypeId();
-        for (Schema.RecordTypeInfo rti : Schema.SObjectType.Account.getRecordTypeInfos()) {
-            if (rti.isAvailable() && rti.getName() == 'Person Account') return rti.getRecordTypeId();
-        }
-        return null;
-    }
 }
+
+
+ 
 ---
 
 ### 1. Umbraco Setup
